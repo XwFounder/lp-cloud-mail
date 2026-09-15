@@ -209,12 +209,38 @@ const loginService = {
 			throw new BizError(t('emailAndPwdEmpty'));
 		}
 
+
 		// ============================
 		// 2. IP
 		// ============================
 		const clientIp =
 			c.req.header('cf-connecting-ip') || 'unknown-ip';
+	// ==================== IP 登录频率限制 ====================
 
+		const rateLimitKey = `rate_limit:login:${clientIp}`;
+
+		let requests = parseInt(
+			await c.env.kv.get(rateLimitKey) || '0',
+			10
+		);
+
+		if (!Number.isFinite(requests) || requests < 0) {
+			requests = 0;
+		}
+
+		if (requests >= 5) {
+			throw new BizError(
+				'请求过于频繁，请 1 分钟后再试'
+			);
+		}
+
+		await c.env.kv.put(
+			rateLimitKey,
+			String(requests + 1),
+			{
+				expirationTtl: 60
+			}
+		);
 		// ============================
 		// 3. 规范化邮箱
 		// ============================
