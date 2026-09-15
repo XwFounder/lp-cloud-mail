@@ -200,59 +200,207 @@ const loginService = {
 	},
 
 	async login(c, params, noVerifyPwd = false) {
+		let { email, password } = params;
 
-		const { email, password } = params;
-
+		// ============================
+		// 1. 基础参数校验
+		// ============================
 		if ((!email || !password) && !noVerifyPwd) {
 			throw new BizError(t('emailAndPwdEmpty'));
 		}
 
-		const userRow = await userService.selectByEmailIncludeDel(c, email);
+		// ============================
+		// 2. IP
+		// ============================
+		const clientIp =
+			c.req.header('cf-connecting-ip') || 'unknown-ip';
 
+		// ============================
+		// 3. 规范化邮箱
+		// ============================
+		if (email) {
+			email = String(email).trim().toLowerCase();
+		}
+
+		// ============================
+		// 4. IP + 邮箱失败计数
+		// ============================
+		const failKey = `login_fail:${clientIp}:${email || 'unknown-email'}`;
+
+		let failCount = parseInt(
+			await c.env.kv.get(failKey) || '0',
+			10
+		);
+
+		// 防止 KV 异常数据
+		if (!Number.isFinite(failCount) || failCount < 0) {
+			failCount = 0;
+		}
+
+		// ============================
+		// 5. 检查是否已经被锁定
+		// ============================
+		if (!noVerifyPwd && failCount >= 5) {
+			throw new BizError(
+				'登录失败次数过多，请 15 分钟后再试'
+			);
+		}
+
+		// ============================
+		// 6. 查询用户
+		// ============================
+		const userRow =
+			await userService.selectByEmailIncludeDel(c, email);
+
+		// ============================
+		// 7. 用户不存在
+		// ============================
 		if (!userRow) {
+			if (!noVerifyPwd) {
+				failCount += 1;
+
+				await c.env.kv.put(
+					failKey,
+					String(failCount),
+					{
+						expirationTtl: 900
+					}
+				);
+			}
+
 			throw new BizError(t('notExistUser'));
 		}
 
-		if(userRow.isDel === isDel.DELETE) {
+		// ============================
+		// 8. 用户已删除
+		// ============================
+		if (userRow.isDel === isDel.DELETE) {
 			throw new BizError(t('isDelUser'));
 		}
 
-		if(userRow.status === userConst.status.BAN) {
+		// ============================
+		// 9. 用户已封禁
+		// ============================
+		if (userRow.status === userConst.status.BAN) {
 			throw new BizError(t('isBanUser'));
 		}
 
-		if (!await cryptoUtils.verifyPassword(password, userRow.salt, userRow.password) && !noVerifyPwd) {
-			throw new BizError(t('IncorrectPwd'));
+		// ============================
+		// 10. 验证密码
+		// ============================
+		if (!noVerifyPwd) {
+			const isPwdValid =
+				await cryptoUtils.verifyPassword(
+					password,
+					userRow.salt,
+					userRow.password
+				);
+
+			// ============================
+			// 11. 密码错误
+			// ============================
+			if (!isPwdValid) {
+				failCount += 1;
+
+				await c.env.kv.put(
+					failKey,
+					String(failCount),
+					{
+						expirationTtl: 900
+					}
+				);
+
+				// 第5次错误后，下一次请求直接进入锁定状态
+				if (failCount >= 5) {
+					throw new BizError(
+						'密码错误次数过多，请 15 分钟后再试'
+					);
+				}
+
+				throw new BizError(t('IncorrectPwd'));
+			}
 		}
 
+		// ============================
+		// 12. 登录成功，清除失败记录
+		// ============================
+		if (!noVerifyPwd && failCount > 0) {
+			await c.env.kv.delete(failKey);
+		}
+
+		// ============================
+		// 13. 生成 UUID
+		// ============================
 		const uuid = uuidv4();
-		const jwt = await JwtUtils.generateToken(c,{ userId: userRow.userId, token: uuid });
 
-		let authInfo = await c.env.kv.get(KvConst.AUTH_INFO + userRow.userId, { type: 'json' });
+		// ============================
+		// 14. 生成 JWT
+		// ============================
+		const jwt = await JwtUtils.generateToken(
+			c,
+			{
+				userId: userRow.userId,
+				token: uuid
+			}
+		);
 
-		if (authInfo && (authInfo.user.email === userRow.email)) {
+		// ============================
+		// 15. 获取已有认证信息
+		// ============================
+		let authInfo = await c.env.kv.get(
+			KvConst.AUTH_INFO + userRow.userId,
+			{
+				type: 'json'
+			}
+		);
+
+		// ============================
+		// 16. 更新 Token
+		// ============================
+		if (
+			authInfo &&
+			authInfo.user &&
+			authInfo.user.email === userRow.email
+		) {
+			if (!Array.isArray(authInfo.tokens)) {
+				authInfo.tokens = [];
+			}
 
 			if (authInfo.tokens.length > 10) {
 				authInfo.tokens.shift();
 			}
 
 			authInfo.tokens.push(uuid);
-
 		} else {
-
 			authInfo = {
-				tokens: [],
+				tokens: [uuid],
 				user: userRow,
 				refreshTime: dayjs().toISOString()
 			};
-
-			authInfo.tokens.push(uuid);
-
 		}
 
-		await userService.updateUserInfo(c, userRow.userId);
+		// ============================
+		// 17. 更新用户信息
+		// ============================
+		await userService.updateUserInfo(
+			c,
+			userRow.userId
+		);
 
-		await c.env.kv.put(KvConst.AUTH_INFO + userRow.userId, JSON.stringify(authInfo), { expirationTtl: constant.TOKEN_EXPIRE });
+		// ============================
+		// 18. 保存认证信息
+		// ============================
+		await c.env.kv.put(
+			KvConst.AUTH_INFO + userRow.userId,
+			JSON.stringify(authInfo),
+			{
+				expirationTtl: constant.TOKEN_EXPIRE
+			}
+		);
+
+		// ============================
+		// 19. 返回 JWT
+		// ============================
 		return jwt;
 	},
 
